@@ -70,7 +70,7 @@ fn validator_transient_stake_address_seed(vote_address: Pubkey) -> String {
     format!("T{}", vote_address)[..32].to_string()
 }
 
-fn validator_stake_address(authorized_staker: Pubkey, vote_address: Pubkey) -> Pubkey {
+pub fn validator_stake_address(authorized_staker: Pubkey, vote_address: Pubkey) -> Pubkey {
     Pubkey::create_with_seed(
         &authorized_staker,
         &validator_stake_address_seed(vote_address),

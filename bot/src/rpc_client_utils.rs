@@ -303,6 +303,46 @@ pub fn get_all_stake(
     Ok((all_stake_addresses, total_stake_balance))
 }
 
+use solana_stake_program::stake_state::StakeState;
+
+pub fn get_all_stake_state(
+    rpc_client: &RpcClient,
+    authorized_staker: Pubkey,
+) -> Result<HashMap<Pubkey, (StakeState, u64)>, Box<dyn error::Error>> {
+    let mut all_stake_addresses = HashMap::new();
+
+    let all_stake_accounts = rpc_client.get_program_accounts_with_config(
+        &solana_stake_program::id(),
+        RpcProgramAccountsConfig {
+            filters: Some(vec![
+                // Filter by `Meta::authorized::staker`, which begins at byte offset 12
+                rpc_filter::RpcFilterType::Memcmp(rpc_filter::Memcmp {
+                    offset: 12,
+                    bytes: rpc_filter::MemcmpEncodedBytes::Binary(authorized_staker.to_string()),
+                    encoding: Some(rpc_filter::MemcmpEncoding::Binary),
+                }),
+            ]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                commitment: Some(rpc_client.commitment()),
+                ..RpcAccountInfoConfig::default()
+            },
+        },
+    )?;
+
+    for (address, account) in all_stake_accounts {
+        all_stake_addresses.insert(
+            address,
+            (
+                bincode::deserialize(account.data.as_slice()).unwrap(),
+                account.lamports,
+            ),
+        );
+    }
+
+    Ok(all_stake_addresses)
+}
+
 #[cfg(test)]
 pub mod test {
     use {

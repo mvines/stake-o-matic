@@ -1,3 +1,15 @@
+/*
+
+   for each mb validator:
+        if legacy stake exists:
+            if active:
+                - change stake auth to new
+                - merge with new
+            if !active:
+                - warn!
+
+*/
+
 use {
     crate::{db::*, generic_stake_pool::*, rpc_client_utils::*},
     clap::{
@@ -22,6 +34,7 @@ use {
         commitment_config::CommitmentConfig,
         native_token::*,
         pubkey::Pubkey,
+        signature::{Keypair, Signer},
         slot_history::{self, SlotHistory},
         stake_history::StakeHistory,
         sysvar,
@@ -551,6 +564,47 @@ fn get_config() -> BoxResult<(Config, RpcClient, Box<dyn GenericStakePool>)> {
             )
         )
         .subcommand(
+            SubCommand::with_name("hack").about("hack it")
+            /*
+            .arg(
+                Arg::with_name("source_stake_address")
+                    .index(1)
+                    .value_name("SOURCE_STAKE_ADDRESS")
+                    .takes_value(true)
+                    .required(true)
+                    .validator(is_pubkey_or_keypair)
+                    .help("The source stake account for splitting individual validator stake accounts from")
+            )
+            */
+            .arg(
+                Arg::with_name("old_authorized_staker")
+                    .index(1)
+                    .value_name("KEYPAIR")
+                    .validator(is_keypair)
+                    .required(true)
+                    .takes_value(true)
+                    .help("Keypair of the authorized staker")
+            )
+            .arg(
+                Arg::with_name("new_authorized_staker")
+                    .index(2)
+                    .value_name("KEYPAIR")
+                    .validator(is_keypair)
+                    .required(true)
+                    .takes_value(true)
+                    .help("Keypair of the authorized staker")
+            )
+            .arg(
+                Arg::with_name("new_reserve_stake_address")
+                    .index(3)
+                    .value_name("RESERVE_STAKE_ADDRESS")
+                    .takes_value(true)
+                    .required(true)
+                    .validator(is_pubkey_or_keypair)
+                    .help("The reserve stake account used to fund the stake pool")
+            )
+        )
+        .subcommand(
             SubCommand::with_name("stake-pool-v0").about("Use the stake-pool v0 solution")
             .arg(
                 Arg::with_name("reserve_stake_address")
@@ -703,7 +757,8 @@ fn get_config() -> BoxResult<(Config, RpcClient, Box<dyn GenericStakePool>)> {
 
     info!("RPC URL: {}", config.json_rpc_url);
     let rpc_client =
-        RpcClient::new_with_timeout(config.json_rpc_url.clone(), Duration::from_secs(180));
+        RpcClient::new_with_timeout_and_commitment(config.json_rpc_url.clone(),
+        Duration::from_secs(180), CommitmentConfig::confirmed());
 
     // Sanity check that the RPC endpoint is healthy before performing too much work
     rpc_client
@@ -711,6 +766,129 @@ fn get_config() -> BoxResult<(Config, RpcClient, Box<dyn GenericStakePool>)> {
         .map_err(|err| format!("RPC endpoint is unhealthy: {:?}", err))?;
 
     let stake_pool: Box<dyn GenericStakePool> = match matches.subcommand() {
+        ("hack", Some(matches)) => {
+            let old_authorized_staker = keypair_of(&matches, "old_authorized_staker").unwrap();
+            let new_authorized_staker = keypair_of(&matches, "new_authorized_staker").unwrap();
+            let new_reserve_stake_address =
+                pubkey_of(&matches, "new_reserve_stake_address").unwrap();
+
+            /*
+            info!("Loading participants...");
+            let participants = get_participants_with_state(
+                &RpcClient::new("https://api.mainnet-beta.solana.com".to_string()),
+                Some(ParticipantState::Approved),
+            )?;
+            */
+            use solana_client::rpc_response::StakeActivationState;
+            use solana_sdk::transaction::Transaction;
+            use solana_stake_program::{stake_instruction, stake_state::StakeAuthorize};
+            info!("old_authorized_staker: {}", old_authorized_staker.pubkey());
+            info!("new_authorized_staker: {}", new_authorized_staker.pubkey());
+            info!("new_reserve_stake_address: {}", new_reserve_stake_address);
+
+            let old_stake =
+                rpc_client_utils::get_all_stake_state(&rpc_client, old_authorized_staker.pubkey())?;
+
+            info!("old_stake: {}", old_stake.len());
+
+            pub mod unknown_voter {
+                solana_sdk::declare_id!("HtpBafRcAtzaw7LXEJaTrA7FHrdws82LCZS3Ju3QmvRW");
+            }
+
+            for (stake_address, (stake_state, lamports)) in old_stake.iter() {
+                let merge_stake_address = match stake_state.delegation() {
+                    None => {
+                        println!(
+                            "stake_address: {} for reserve: {}",
+                            stake_address,
+                            Sol(*lamports)
+                        );
+                        new_reserve_stake_address
+                    }
+                    Some(delegation) => {
+                        let stake_activation = rpc_client
+                            .get_stake_activation(*stake_address, None)
+                            .unwrap();
+                        match stake_activation.state {
+                            StakeActivationState::Active => {
+                                println!(
+                                    "stake_address: {} {:?} for {:?}: {}",
+                                    stake_address,
+                                    stake_activation,
+                                    delegation.voter_pubkey,
+                                    Sol(*lamports)
+                                );
+                                if delegation.voter_pubkey == unknown_voter::id() {
+                                    println!("**** SKIP UNKNOWN VOTER ***");
+                                    continue;
+                                }
+
+                                let new_stake_address = stake_pool_v0::validator_stake_address(
+                                    new_authorized_staker.pubkey(),
+                                    delegation.voter_pubkey,
+                                );
+                                //println!("  new: {}", new_stake_address);
+                                let new_stake_activation = rpc_client
+                                    .get_stake_activation(new_stake_address, None)
+                                    .unwrap();
+                                //println!("   new_stake_activation: {:?}", new_stake_activation);
+                                assert_eq!(
+                                    new_stake_activation.state,
+                                    StakeActivationState::Active
+                                );
+                                new_stake_address
+                            }
+                            StakeActivationState::Inactive => {
+                                println!(
+                                    "stake_address: {} for reserve: {}",
+                                    stake_address,
+                                    Sol(*lamports)
+                                );
+                                new_reserve_stake_address
+                            }
+                            _ => {
+                                println!(
+                                    "stake_address: {} SKIP {}",
+                                    stake_address,
+                                    Sol(*lamports)
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                println!("!! MERGE {} into {}", stake_address, merge_stake_address);
+
+                let mut i = vec![stake_instruction::authorize(
+                    stake_address,
+                    &old_authorized_staker.pubkey(),
+                    &new_authorized_staker.pubkey(),
+                    StakeAuthorize::Staker,
+                    None,
+                )];
+
+                i.extend(stake_instruction::merge(
+                    &merge_stake_address,
+                    &stake_address,
+                    &new_authorized_staker.pubkey(),
+                ));
+                let mut transaction =
+                    Transaction::new_with_payer(&i, Some(&new_authorized_staker.pubkey()));
+                transaction.sign(
+                    &[&old_authorized_staker, &new_authorized_staker],
+                    rpc_client.get_recent_blockhash()?.0,
+                );
+                // SEND IT???
+                println!("SENDING IT");
+                let sig = rpc_client.send_and_confirm_transaction_with_spinner(&transaction);
+                //let sig = rpc_client.send_transaction(&transaction)?;
+                println!("Confirmed: {:?}", sig);
+             //   process::exit(1);
+            }
+
+            process::exit(1);
+        }
         ("legacy", Some(matches)) => {
             let authorized_staker = keypair_of(&matches, "authorized_staker").unwrap();
             let source_stake_address = pubkey_of(&matches, "source_stake_address").unwrap();
